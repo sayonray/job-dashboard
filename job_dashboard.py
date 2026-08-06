@@ -37,6 +37,11 @@ try:
 except ImportError:
     raise SystemExit("Missing dependency. Run:  pip install requests")
 
+try:
+    from linkedin_email import fetch_linkedin_email_jobs
+except ImportError:
+    fetch_linkedin_email_jobs = None
+
 
 # =============================================================================
 # YOUR SETTINGS — edit this section only
@@ -127,6 +132,34 @@ ENTRY_LEVEL_HINTS = [
 GREENHOUSE_COMPANIES = []
 LEVER_COMPANIES = []
 
+# --- LinkedIn job alerts via email ---------------------------------------
+# This reads LinkedIn's own alert emails out of your inbox. It does NOT
+# contact linkedin.com — no scraping, no bot, nothing against their terms.
+#
+# SETUP:
+#   1. On LinkedIn: Jobs -> run your search -> Save search -> alerts DAILY.
+#      Do this once per search you care about.
+#   2. Gmail users: enable 2FA, then create an App Password at
+#      myaccount.google.com/apppasswords (your normal password won't work).
+#   3. Set these environment variables:
+#        $env:EMAIL_ADDRESS="you@gmail.com"
+#        $env:EMAIL_APP_PASSWORD="the-16-char-app-password"
+#   4. pip install beautifulsoup4
+# Set to True only if you set up a personal email + app password.
+# See linkedin_email.py for setup notes. Off by default.
+ENABLE_LINKEDIN_EMAIL = False
+
+IMAP_HOST = "imap.gmail.com"        # Outlook: outlook.office365.com
+                                     # Yahoo:   imap.mail.yahoo.com
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "")
+EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD", "")
+LINKEDIN_DAYS_BACK = 2               # overlap so a missed run loses nothing
+
+# --- Archive ---
+# Each run also saves a dated copy so you can go back to previous days.
+ARCHIVE_DIR = "archive"
+ARCHIVE_DAYS_ON_INDEX = 30   # how many past days to list on the index page
+
 # --- How many jobs to show per day ---
 # The rest stay queued and surface on following days, best-first.
 MAX_JOBS_PER_DAY = 10
@@ -149,6 +182,8 @@ RESULTS_PER_PAGE = 20
 HERE = Path(__file__).parent
 SEEN_PATH = HERE / "seen_jobs.json"
 DASHBOARD_PATH = HERE / "dashboard.html"
+ARCHIVE_PATH = HERE / ARCHIVE_DIR
+INDEX_PATH = HERE / "index.html"
 
 ALL_KEYWORDS = [kw for group in KEYWORD_GROUPS.values() for kw in group]
 KEYWORD_TO_GROUP = {kw: name for name, kws in KEYWORD_GROUPS.items() for kw in kws}
@@ -249,6 +284,11 @@ def relevance_score(job):
     # Explicit entry-level signals
     if any(h in tl for h in ENTRY_LEVEL_HINTS):
         score += 15
+
+    # LinkedIn already matched these against your saved search, so they
+    # tend to be more on-target than a raw keyword API hit.
+    if "linkedin" in job.get("source", "").lower():
+        score += 10
 
     # Location preference
     ll = job.get("location", "").lower()
@@ -420,41 +460,113 @@ def fetch_lever(token):
 
 
 # ------------------------------------------------------------- dashboard ----
-def build_dashboard(jobs):
-    if jobs:
-        rows = "".join(
-            f"<tr><td>{j['title']}</td><td>{j['company']}</td>"
-            f"<td>{j['location']}</td><td><span class=\"tag\">{j.get('group','—')}</span></td>"
-            f"<td><a href=\"{j['url']}\" target=\"_blank\" rel=\"noopener\">Open &rarr;</a></td></tr>"
-            for j in jobs
-        )
-        body = ("<table><tr><th>Title</th><th>Company</th><th>Location</th>"
-                "<th>Category</th><th>Apply</th></tr>" + rows + "</table>")
-    else:
-        body = '<div class="empty">No new matching jobs today.</div>'
+SHARED_CSS = """
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:920px;
+margin:40px auto;padding:0 20px;color:#1a1a1a}
+h1{font-size:22px;margin-bottom:4px}
+.meta{color:#666;margin-bottom:8px;font-size:14px}
+.nav{margin-bottom:24px;font-size:14px}
+.nav a{margin-right:16px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:10px 8px;border-bottom:1px solid #eee;font-size:14px}
+th{color:#666;font-weight:600}
+tr:hover td{background:#fafafa}
+a{color:#c15f3c;text-decoration:none;font-weight:600}
+a:hover{text-decoration:underline}
+.empty{color:#888;padding:48px 0;text-align:center}
+.tag{background:#f0ede8;color:#5a544c;padding:2px 8px;border-radius:10px;
+font-size:12px;white-space:nowrap}
+ul.days{list-style:none;padding:0}
+ul.days li{padding:10px 8px;border-bottom:1px solid #eee;font-size:14px}
+ul.days .count{color:#888;font-weight:400;margin-left:8px}
+"""
 
-    html = f"""<!DOCTYPE html>
+
+def _render_page(title, heading, subtitle, body, nav_links):
+    nav = " ".join(f'<a href="{href}">{label}</a>' for label, href in nav_links)
+    return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
-<title>Job Dashboard — {datetime.now():%b %d, %Y}</title>
-<style>
-body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:920px;
-margin:40px auto;padding:0 20px;color:#1a1a1a}}
-h1{{font-size:22px;margin-bottom:4px}}
-.meta{{color:#666;margin-bottom:24px;font-size:14px}}
-table{{width:100%;border-collapse:collapse}}
-th,td{{text-align:left;padding:10px 8px;border-bottom:1px solid #eee;font-size:14px}}
-th{{color:#666;font-weight:600}}
-tr:hover td{{background:#fafafa}}
-a{{color:#c15f3c;text-decoration:none;font-weight:600}}
-a:hover{{text-decoration:underline}}
-.empty{{color:#888;padding:48px 0;text-align:center}}
-.tag{{background:#f0ede8;color:#5a544c;padding:2px 8px;border-radius:10px;font-size:12px;white-space:nowrap}}
-</style></head><body>
-<h1>New jobs — {datetime.now():%A, %B %d, %Y}</h1>
-<div class="meta">{len(jobs)} new listing(s) since last run</div>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>{SHARED_CSS}</style></head><body>
+<h1>{heading}</h1>
+<div class="meta">{subtitle}</div>
+<div class="nav">{nav}</div>
 {body}
 </body></html>"""
-    DASHBOARD_PATH.write_text(html, encoding="utf-8")
+
+
+def _jobs_table(jobs):
+    if not jobs:
+        return '<div class="empty">No new matching jobs this day.</div>'
+    rows = "".join(
+        f"<tr><td>{j['title']}</td><td>{j['company']}</td>"
+        f"<td>{j['location']}</td>"
+        f"<td><span class=\"tag\">{j.get('group','—')}</span></td>"
+        f"<td><a href=\"{j['url']}\" target=\"_blank\" rel=\"noopener\">Open &rarr;</a></td></tr>"
+        for j in jobs
+    )
+    return ("<table><tr><th>Title</th><th>Company</th><th>Location</th>"
+            "<th>Category</th><th>Apply</th></tr>" + rows + "</table>")
+
+
+def build_dashboard(jobs):
+    """Write today's dashboard, a dated archive copy, and refresh the index."""
+    today = datetime.now()
+    date_slug = today.strftime("%Y-%m-%d")
+
+    body = _jobs_table(jobs)
+    subtitle = f"{len(jobs)} new listing(s) since last run"
+
+    # Today's page, at the stable URL
+    DASHBOARD_PATH.write_text(_render_page(
+        f"Job Dashboard — {today:%b %d, %Y}",
+        f"New jobs — {today:%A, %B %d, %Y}",
+        subtitle, body,
+        [("All days", "index.html")],
+    ), encoding="utf-8")
+
+    # Dated archive copy (relative links go up one level)
+    ARCHIVE_PATH.mkdir(exist_ok=True)
+    (ARCHIVE_PATH / f"{date_slug}.html").write_text(_render_page(
+        f"Job Dashboard — {today:%b %d, %Y}",
+        f"Jobs — {today:%A, %B %d, %Y}",
+        f"{len(jobs)} listing(s)", body,
+        [("Latest", "../dashboard.html"), ("All days", "../index.html")],
+    ), encoding="utf-8")
+
+    build_index()
+
+
+def build_index():
+    """Rebuild the index listing every archived day, newest first."""
+    ARCHIVE_PATH.mkdir(exist_ok=True)
+    files = sorted(ARCHIVE_PATH.glob("*.html"), reverse=True)
+
+    items = []
+    for path in files[:ARCHIVE_DAYS_ON_INDEX]:
+        slug = path.stem
+        try:
+            label = datetime.strptime(slug, "%Y-%m-%d").strftime("%A, %B %d, %Y")
+        except ValueError:
+            label = slug
+        # Count rows without parsing HTML properly - each job is one <tr> after the header
+        try:
+            count = max(path.read_text(encoding="utf-8").count("<tr>") - 1, 0)
+            suffix = f'<span class="count">{count} job(s)</span>'
+        except OSError:
+            suffix = ""
+        items.append(f'<li><a href="{ARCHIVE_DIR}/{path.name}">{label}</a>{suffix}</li>')
+
+    body = (f'<ul class="days">{"".join(items)}</ul>' if items
+            else '<div class="empty">No archived days yet.</div>')
+
+    INDEX_PATH.write_text(_render_page(
+        "Job Dashboard — All days",
+        "Job Dashboard",
+        f"{len(files)} day(s) archived", body,
+        [("Latest", "dashboard.html")],
+    ), encoding="utf-8")
 
 
 # ------------------------------------------------------------------ main ----
@@ -467,6 +579,21 @@ def main():
     remoteok = fetch_remoteok()
     print(f"  -> {len(remoteok)} results")
 
+    linkedin = []
+    if ENABLE_LINKEDIN_EMAIL:
+        print("Reading LinkedIn alert emails...")
+        if fetch_linkedin_email_jobs is None:
+            print("  [linkedin-email] linkedin_email.py not found next to this "
+                  "script — skipping.")
+        else:
+            linkedin = fetch_linkedin_email_jobs(
+                IMAP_HOST, EMAIL_ADDRESS, EMAIL_APP_PASSWORD,
+                days_back=LINKEDIN_DAYS_BACK,
+            )
+            for j in linkedin:
+                j["group"] = _infer_group(j["title"])
+        print(f"  -> {len(linkedin)} results")
+
     if GREENHOUSE_COMPANIES or LEVER_COMPANIES:
         print("Fetching company boards...")
         boards = []
@@ -478,7 +605,7 @@ def main():
     else:
         boards = []
 
-    all_jobs = adzuna + remoteok + boards
+    all_jobs = adzuna + remoteok + linkedin + boards
 
     entry_level = [j for j in all_jobs if is_entry_level(j["title"])]
     dropped_senior = len(all_jobs) - len(entry_level)
